@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
-"""Forecast GTA VI's launch-day Twitch viewers, hour by hour.
+"""Hour-by-hour Twitch forecast for GTA VI's launch day.
 
-Reads every case file (*.in) in the input directory. A case holds the
-category's history up to the end of release-day hour 1, that hour's viewer
-count, and a library of past big launches ("comparables") with their full
-hourly curves. For each of hours 2..24 the program writes five quantiles
-of that hour's viewer count to <id>.out.
+The program takes one case file at a time from the input directory. A
+case says what the Grand Theft Auto VI category on Twitch did up to the
+end of hour 1 of release day, and it bundles the hourly curves of dozens
+of earlier big launches. For every hour from 2 to 24 the program writes
+five quantiles of that hour's viewer count.
 
-Idea: a launch day is largely foretold by the shape of its first hours.
-The hours before the checkpoint trace the unlock staircase -- which
-regions unlocked when -- and launches whose staircase and scale resemble
-this one tend to unfold alike. So the forecast is a similarity-weighted
-distribution of the comparables' log-ratios ln(viewers_h / viewers_1):
-each comparable gets a Gaussian-kernel weight from the root-mean-square
-gap between its pre-checkpoint log-ratio profile and the target's, times
-a kernel on the gap between the two hour-1 counts. For each forecast
-hour, the weighted empirical quantiles of the log-ratios are blended
-with a weighted normal fit of the same sample, which steadies the tails
-where the effective sample is thin. Deterministic, offline, standard
-library only.
+How it reasons: launches that opened alike tend to play out alike. The
+hours before the checkpoint show each launch's unlock staircase -- the
+regions coming online one after another -- so the program measures how
+closely a past launch's staircase and opening size match this one's, and
+lets the closest matches speak loudest. Concretely, each past launch
+contributes the log-ratio of its hour-h viewers to its hour-1 viewers,
+weighted by a Gaussian kernel over staircase distance and over opening
+size. Each hour's quantiles come from the weighted empirical quantiles of
+those ratios, pulled partway toward a weighted normal fit so thin tails
+do not wag the forecast. When no past launch covers an hour, the forecast
+holds hour 1's level with a spread that grows as the day goes on.
+
+Everything is a deterministic function of the case file: no network, no
+clock, no randomness, standard library only.
 """
 
 import json
@@ -28,74 +30,127 @@ from datetime import datetime
 from pathlib import Path
 from statistics import NormalDist
 
-IN_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
+CASE_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
-# Quantile levels the contest scores.
-TAUS = (0.05, 0.25, 0.5, 0.75, 0.95)
+LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
+Z_SCORES = tuple(NormalDist().inv_cdf(t) for t in LEVELS)
 
-# Profile window: whole-hour offsets from the day's first hour, reaching
-# back over the day before release, where the unlock staircase shows.
-PROFILE_START = -31
-
-# Kernel widths and the empirical/normal blend, fitted on the kit's
-# practice launches (mean pinball loss about 0.19, house baseline 0.39).
-BAND_PROFILE = 1.5
-BAND_SCALE = 0.75
-NORMAL_BLEND = 0.6
-MIN_SHARED = 4
+LOOKBACK = 31        # profile reaches this many hours before hour 1
+WIDTH_STAIRCASE = 1.5
+WIDTH_OPENING = 0.75
+PULL_TO_NORMAL = 0.6
+MIN_OVERLAP = 4
 
 
-def instant(text):
-    """Parse an ISO 8601 timestamp (trailing Z allowed)."""
+def _moment(text):
+    """An ISO 8601 timestamp, trailing Z included, as a datetime."""
     return datetime.fromisoformat(text.replace("Z", "+00:00"))
 
 
-def hourly_series(points, day_start, stamp_key):
-    """Viewer counts keyed by whole-hour offset from the day's first hour."""
-    start = instant(day_start)
+def _hourly(points, day_start, key):
+    """Collapse timestamped points into {whole-hour offset: viewers}.
+
+    Offsets count from the day's first hour. A later point in the same
+    hour replaces an earlier one, which is how whole-hour means arrive.
+    """
+    start = _moment(day_start)
     series = {}
     for point in points or []:
         viewers = point.get("viewers")
         if viewers is None:
             continue
-        delta = (instant(point[stamp_key]) - start).total_seconds()
+        delta = (_moment(point[key]) - start).total_seconds()
         series[int(delta // 3600)] = viewers
     return series
 
 
-def target_series(case):
-    """The target's hourly viewers: whole-hour means when the case carries
-    them, else the raw history points averaged per hour."""
-    hourly = case.get("history_hourly")
-    if hourly:
-        return hourly_series(hourly, case["day_start"], "from")
-    start = instant(case["day_start"])
-    totals, counts = {}, {}
+def _target_hours(case):
+    """The target's hourly viewers, preferring the case's whole-hour
+    means and otherwise averaging its raw points within each hour."""
+    if case.get("history_hourly"):
+        return _hourly(case["history_hourly"], case["day_start"], "from")
+    start = _moment(case["day_start"])
+    buckets = {}
     for point in case.get("history") or []:
         viewers = point.get("viewers")
         if viewers is None:
             continue
-        off = int((instant(point["at"]) - start).total_seconds() // 3600)
-        totals[off] = totals.get(off, 0.0) + viewers
-        counts[off] = counts.get(off, 0) + 1
-    return {off: totals[off] / counts[off] for off in totals}
+        off = int((_moment(point["at"]) - start).total_seconds() // 3600)
+        buckets.setdefault(off, []).append(viewers)
+    return {off: sum(vals) / len(vals) for off, vals in buckets.items()}
 
 
-def profile_ratios(series, base, offsets):
-    """ln(viewers / base) at each offset, None where the hour is missing."""
-    out = []
-    for off in offsets:
-        value = series.get(off)
+def _ratios(series, base):
+    """ln(viewers / base) per hour offset, skipping missing or dead hours."""
+    out = {}
+    for off, value in series.items():
         if value and value > 0 and base > 0:
-            out.append(math.log(value / base))
-        else:
-            out.append(None)
+            out[off] = math.log(value / base)
     return out
 
 
-def wquantile(pairs, tau):
-    """Weighted empirical quantile of (value, weight) pairs, interpolated."""
+class Comparable:
+    """One past launch, with its release-day curve and its log-ratios.
+
+    ``day`` maps hours 1..24 to viewer counts; ``ratios`` maps the same
+    hours to ln(viewers / hour-1 viewers). A launch only counts when its
+    hour 1 is present, so the ratios exist at all.
+    """
+
+    def __init__(self, raw):
+        self.name = raw.get("name", "")
+        series = _hourly(raw.get("hourly"), raw["day_start"], "from")
+        self.day = {h: series.get(h - 1) for h in range(1, 25)}
+        self.series = series
+        self.ratios = _ratios(self.day, self.day.get(1) or 0) if self.day.get(1) else {}
+
+    @property
+    def usable(self):
+        return bool(self.day.get(1))
+
+    def staircase(self):
+        """Log-ratios over the pre-checkpoint window, as {offset: value}."""
+        prof = _ratios(self.series, self.day[1])
+        return {o: v for o, v in prof.items() if -LOOKBACK <= o < 1}
+
+
+def _opening_viewers(case):
+    """Hour 1's print from the known rows; 1.0 when the case has none."""
+    for known in case.get("known") or []:
+        if known.get("hour") == 1 and known.get("viewers"):
+            return max(1.0, float(known["viewers"]))
+    return 1.0
+
+
+def _weights(comps, target_prof, p1):
+    """Kernel weight per comparable from staircase and opening-size gaps.
+
+    Comparables sharing too little staircase with the target get zero.
+    When nothing scores above zero -- the target's history is too thin
+    to place it -- every comparable counts equally instead.
+    """
+    target_log = math.log(max(1.0, p1))
+    weights = []
+    for comp in comps:
+        theirs = comp.staircase()
+        common = [o for o in target_prof if o in theirs]
+        if len(common) < MIN_OVERLAP:
+            weights.append(0.0)
+            continue
+        rms = math.sqrt(sum((target_prof[o] - theirs[o]) ** 2
+                            for o in common) / len(common))
+        gap = abs(math.log(comp.day[1]) - target_log)
+        weights.append(math.exp(-0.5 * (rms / WIDTH_STAIRCASE) ** 2)
+                       * math.exp(-0.5 * (gap / WIDTH_OPENING) ** 2))
+    if comps and not any(w > 0 for w in weights):
+        weights = [1.0] * len(comps)
+    return weights
+
+
+def _wquantile(pairs, tau):
+    """Weighted empirical quantile of (value, weight) pairs, interpolated
+    across the step where the cumulative weight crosses tau."""
     ordered = sorted(pairs)
     total = sum(w for _, w in ordered)
     if total <= 0:
@@ -106,114 +161,60 @@ def wquantile(pairs, tau):
         if acc / total >= tau:
             if i == 0:
                 return value
-            prev_value = ordered[i - 1][0]
+            prev = ordered[i - 1][0]
             frac = (tau * total - (acc - weight)) / weight if weight > 0 else 0.0
-            return prev_value + (value - prev_value) * min(1.0, max(0.0, frac))
+            return prev + (value - prev) * min(1.0, max(0.0, frac))
     return ordered[-1][0]
 
 
-def round_half_up_2dp(x):
-    """Round to 2 decimals, half up; whole numbers come back as ints, so
-    the JSON writes 1240 rather than 1240.0."""
-    scaled = x * 100
-    whole = math.floor(scaled)
-    if scaled - whole >= 0.5:
-        whole += 1
-    value = whole / 100
-    return int(value) if float(value).is_integer() else value
+def _round2(value):
+    """Round half up to 2 decimals; whole results come back as ints so
+    the JSON writes 1240 instead of 1240.0."""
+    rounded = math.floor(value * 100 + 0.5) / 100
+    return int(rounded) if rounded == int(rounded) else rounded
 
 
-def collect_comparables(case):
-    """Usable comparables, sorted by name for determinism: each holds its
-    release-day curve {hour 1..24: viewers} and its full offset series.
-
-    A comparable is usable when its release day's first hour is present,
-    so its log-ratios to that hour exist. The target category's own
-    pre-release history is not a launch and is left out.
-    """
-    game_name = (case.get("game") or {}).get("name", "")
-    pool = []
-    for comp in case.get("comparables") or []:
-        name = comp.get("name", "")
-        if game_name and game_name in name:
-            continue
-        series = hourly_series(comp.get("hourly"), comp["day_start"], "from")
-        day = {h: series.get(h - 1) for h in range(1, 25)}
-        if day.get(1):
-            pool.append({"name": name, "day": day, "series": series})
-    pool.sort(key=lambda item: item["name"])
-    return pool
-
-
-def kernel_weights(pool, target, p1):
-    """One kernel weight per pool entry, from profile and scale distance.
-
-    Falls back to equal weights when the target's history is too sparse
-    to place it among the launches.
-    """
-    offsets = list(range(PROFILE_START, 1))
-    mine = profile_ratios(target, p1, offsets)
-    target_log = math.log(max(1.0, p1))
-    weights = []
-    for entry in pool:
-        theirs = profile_ratios(entry["series"], entry["day"][1], offsets)
-        sq, shared = 0.0, 0
-        for a, b in zip(mine, theirs):
-            if a is not None and b is not None:
-                sq += (a - b) ** 2
-                shared += 1
-        if shared < MIN_SHARED:
-            weights.append(0.0)
-            continue
-        rms = math.sqrt(sq / shared)
-        scale_gap = abs(math.log(entry["day"][1]) - target_log)
-        weights.append(math.exp(-0.5 * (rms / BAND_PROFILE) ** 2)
-                       * math.exp(-0.5 * (scale_gap / BAND_SCALE) ** 2))
-    if pool and not any(w > 0 for w in weights):
-        weights = [1.0] * len(pool)
-    return weights
-
-
-def hour1_print(case):
-    """Hour 1's viewer count from the case's known rows (1.0 if absent)."""
-    for known in case.get("known") or []:
-        if known.get("hour") == 1 and known.get("viewers"):
-            return max(1.0, float(known["viewers"]))
-    return 1.0
-
-
-def forecast_case(case):
-    """Five quantiles per forecast hour, as log-ratios to hour 1's print
-    converted back to viewer counts."""
-    p1 = hour1_print(case)
-    levels = case.get("levels") or list(TAUS)
+def forecast(case):
+    """The forecast object for one case: five quantiles per hour, 2..24."""
+    p1 = _opening_viewers(case)
+    levels = case.get("levels") or list(LEVELS)
     zetas = [NormalDist().inv_cdf(t) for t in levels]
-    rows = sorted(case["forecast"], key=lambda r: r["hour"])
+    plan = sorted(case["forecast"], key=lambda r: r["hour"])
 
-    series = target_series(case)
-    pool = collect_comparables(case)
-    weights = kernel_weights(pool, series, p1) if pool else []
+    target = _target_hours(case)
+    target_prof = {o: v for o, v in _ratios(target, p1).items()
+                   if -LOOKBACK <= o < 1}
+
+    game = (case.get("game") or {}).get("name", "")
+    comps = []
+    for raw in case.get("comparables") or []:
+        comp = Comparable(raw)
+        if not comp.usable:
+            continue
+        if game and game in comp.name:
+            continue  # the target's own pre-release history, not a launch
+        comps.append(comp)
+    comps.sort(key=lambda c: c.name)
+    weights = _weights(comps, target_prof, p1)
 
     hours = []
-    for row in rows:
+    for row in plan:
         h = row["hour"]
-        pairs = []
-        for entry, w in zip(pool, weights):
-            if w > 0 and entry["day"].get(h):
-                pairs.append((math.log(entry["day"][h] / entry["day"][1]), w))
+        pairs = [(c.ratios[h], w) for c, w in zip(comps, weights)
+                 if w > 0 and h in c.ratios]
         if pairs:
-            total_w = sum(w for _, w in pairs)
-            mean = sum(v * w for v, w in pairs) / total_w
-            var = sum(w * (v - mean) ** 2 for v, w in pairs) / total_w
+            total = sum(w for _, w in pairs)
+            mean = sum(v * w for v, w in pairs) / total
+            var = sum(w * (v - mean) ** 2 for v, w in pairs) / total
             spread = math.sqrt(max(var, 1e-6))
             ratios = []
             for tau, z in zip(levels, zetas):
-                emp = wquantile(pairs, tau)
-                ratios.append(emp * (1 - NORMAL_BLEND)
-                              + (mean + z * spread) * NORMAL_BLEND)
+                emp = _wquantile(pairs, tau)
+                ratios.append(emp * (1 - PULL_TO_NORMAL)
+                              + (mean + z * spread) * PULL_TO_NORMAL)
         else:
-            # No comparable speaks for this hour: stay at hour 1's count
-            # with a lognormal spread that widens over the day.
+            # Nothing in the library covers this hour: hold hour 1's
+            # level and let the spread widen with the hour.
             sigma = 0.25 + 0.05 * math.sqrt(max(0, h - 1))
             ratios = [z * sigma for z in zetas]
         ratios.sort()
@@ -222,7 +223,7 @@ def forecast_case(case):
         for r in ratios:
             value = p1 * math.exp(r)
             value = min(1e9, max(value, prev, 1e-6))
-            values.append(round_half_up_2dp(value))
+            values.append(_round2(value))
             prev = value
         hours.append({"hour": h, "q": values})
     return {"hours": hours}
@@ -230,11 +231,11 @@ def forecast_case(case):
 
 def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    for path in sorted(IN_DIR.glob("*.in")):
+    for path in sorted(CASE_DIR.glob("*.in")):
         case = json.loads(path.read_text(encoding="utf-8"))
-        result = forecast_case(case)
-        text = json.dumps(result, separators=(",", ":")) + "\n"
-        (OUT_DIR / f"{path.stem}.out").write_text(text, encoding="utf-8")
+        payload = forecast(case)
+        text = json.dumps(payload, separators=(",", ":")) + "\n"
+        (OUT_DIR / (path.stem + ".out")).write_text(text, encoding="utf-8")
 
 
 if __name__ == "__main__":
