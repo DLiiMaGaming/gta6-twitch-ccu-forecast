@@ -1,3 +1,7 @@
+[![make.fun · gta6-twitch-ccu-forecast-01](https://make.fun/badge/gta6-twitch-ccu-forecast-01.svg)](https://make.fun/bounty/gta6-twitch-ccu-forecast-01)
+[![rank](https://make.fun/badge/gta6-twitch-ccu-forecast-01/DLiiMaGaming/gta6-twitch-ccu-forecast/rank.svg)](https://make.fun/bounty/gta6-twitch-ccu-forecast-01/leaderboard)
+[![reward](https://make.fun/badge/gta6-twitch-ccu-forecast-01/DLiiMaGaming/gta6-twitch-ccu-forecast/reward.svg)](https://make.fun/bounty/gta6-twitch-ccu-forecast-01)
+
 # GTA VI Twitch CCU forecast — make.fun entry
 
 Entry for `gta6-twitch-ccu-forecast-01`: forecast the Twitch concurrent
