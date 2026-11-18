@@ -33,7 +33,9 @@ level with a spread that widens as the day goes on.
 
 The program is a pure function of the case file: standard library
 only, no network, no clock, no randomness, no state between cases.
-The same input always produces the same output.
+The same input always produces the same output. A case that lists no
+forecast rows is read as hours 2..24, so the program still writes a
+complete output instead of crashing on a malformed case.
 
 Tuning
 ------
@@ -288,7 +290,8 @@ def forecast(case):
     weights = kernel_weights(refs, target_staircase, hour_one)
 
     hours = []
-    for row in sorted(case["forecast"], key=lambda r: r["hour"]):
+    plan = case.get("forecast") or [{"hour": h} for h in range(2, 25)]
+    for row in sorted(plan, key=lambda r: r["hour"]):
         hour = row["hour"]
         hours.append({"hour": hour,
                       "q": predict_hour(hour, refs, weights, hour_one,
